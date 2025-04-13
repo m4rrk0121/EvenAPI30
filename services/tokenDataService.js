@@ -1,209 +1,448 @@
 // services/tokenDataService.js
-const axios = require('axios');
-const cron = require('node-cron');
-const Token = require('../models/Token');
-const TokenPrice = require('../models/TokenPrice');
+const { ethers } = require('ethers');
+const mongoose = require('mongoose');
 require('dotenv').config();
 
-// Create a configured axios instance for API calls
-const geckoTerminalApi = axios.create({
-  baseURL: 'https://api.geckoterminal.com/api/v2',
-  timeout: 30000,
-  headers: {
-    'Accept': 'application/json'
+// Import models
+const Token = require('../models/Token');
+const TokenPrice = require('../models/TokenPrice');
+
+class TokenPriceTracker {
+  constructor() {
+    this.wsProvider = null;
+    this.tokens = [];
+    this.wethPriceUsd = null;
+    
+    // Base network constants
+    this.WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
+    this.USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+    this.UNISWAP_FACTORY = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
   }
-});
 
-// Track API usage
-let apiCallsThisMinute = 0;
-let apiCallReset = null;
-
-// Reset API call counter every minute
-function setupApiCallTracking() {
-  apiCallReset = setInterval(() => {
-    apiCallsThisMinute = 0;
-    console.log('API call counter reset');
-  }, 60000);
-}
-
-// Function to fetch price data for a batch of tokens
-async function fetchPriceData(addresses) {
-  try {
-    // Track API usage
-    apiCallsThisMinute++;
-    console.log(`API call ${apiCallsThisMinute}/30 this minute`);
-    
-    // Format addresses for GeckoTerminal (comma-separated, URL encoded)
-    const addressesParam = addresses.map(addr => addr.toLowerCase()).join('%2C');
-    
-    console.log(`Fetching price data for ${addresses.length} tokens from GeckoTerminal`);
-    
-    // Make the API call to GeckoTerminal
+  async initialize() {
     try {
-      const response = await geckoTerminalApi.get(`/networks/base/tokens/multi/${addressesParam}`);
+      // Connect to database
+      await mongoose.connect(process.env.MONGODB_URI);
+      console.log('MongoDB Connected');
+  
+      // Setup change stream for new tokens
+      await this.setupChangeStream();
+  
+      // Load tokens from v2 collection
+      this.tokens = await Token.find({});
+      console.log(`Loaded ${this.tokens.length} tokens`);
+  
+      // Connect WebSocket
+      this.wsProvider = new ethers.WebSocketProvider(process.env.WS_RPC_URL);
+  
+      // Retrieve initial WETH price
+      await this.retrieveInitialWethPrice();
+  
+      // Track WETH price 
+      await this.trackWethPrice();
+  
+      // Start tracking token prices
+      this.trackTokenPrices();
+  
+    } catch (error) {
+      console.error('Initialization Error:', error);
+      this.reconnect();
+    }
+  }
+
+  async setupChangeStream() {
+    try {
+      // Watch for new tokens being added to collection
+      const tokenChangeStream = Token.watch([], {
+        fullDocument: 'updateLookup'
+      });
+
+      tokenChangeStream.on('change', async (change) => {
+        try {
+          // Only handle new token insertions
+          if (change.operationType === 'insert') {
+            const newToken = change.fullDocument;
+            console.log(`New token detected: ${newToken.symbol}`);
+            
+            // Find pool and setup subscription
+            const pool = await this.findTokenPool(newToken.contractAddress);
+            if (pool) {
+              this.subscribeToPool(pool, newToken);
+              console.log(`Successfully subscribed to pool for new token: ${newToken.symbol}`);
+            } else {
+              console.log(`No pool found for new token: ${newToken.symbol}`);
+            }
+          }
+        } catch (error) {
+          console.error('Error processing new token:', error);
+        }
+      });
+
+      console.log('Token change stream setup successfully');
+    } catch (error) {
+      console.error('Error setting up token change stream:', error);
+      // Try to reconnect
+      setTimeout(() => this.setupChangeStream(), 5000);
+    }
+  }
+
+  async retrieveInitialWethPrice() {
+    try {
+      const poolAddress = await this.findWethUsdcPool();
+      if (!poolAddress) {
+        console.error('Cannot retrieve initial WETH price: No pool found');
+        return;
+      }
+  
+      const poolABI = [
+        "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+        "function token0() view returns (address)",
+        "function token1() view returns (address)"
+      ];
+  
+      const poolContract = new ethers.Contract(poolAddress, poolABI, this.wsProvider);
       
-      // Format the response to match our API format
-      const result = { tokens: {} };
+      // Get both tokens to verify the direction
+      const [token0, token1, slot0] = await Promise.all([
+        poolContract.token0(),
+        poolContract.token1(),
+        poolContract.slot0()
+      ]);
+  
+      const sqrtPriceX96 = slot0[0];
       
-      if (response.data && response.data.data) {
-        response.data.data.forEach(token => {
-          const attributes = token.attributes;
-          const address = token.id.split('_')[1].toLowerCase();
-          
-          result.tokens[address] = {
-            price_usd: parseFloat(attributes.price_usd || 0),
-            fdv_usd: parseFloat(attributes.fdv_usd || 0),
-            volume_usd: parseFloat(attributes.volume_usd?.h24 || 0),
-            last_updated: new Date(),
-            name: attributes.name,
-            symbol: attributes.symbol,
-            total_reserve_in_usd: parseFloat(attributes.total_reserve_in_usd || 0),
-            total_supply: parseFloat(attributes.total_supply || 0),
-          };
-        });
+      console.log('Pool token details:', {
+        token0,
+        token1,
+        WETH_ADDRESS: this.WETH_ADDRESS,
+        USDC_ADDRESS: this.USDC_ADDRESS
+      });
+  
+      console.log(`Retrieved sqrtPriceX96: ${sqrtPriceX96}`);
+  
+      // Calculate price
+      const price = this.calculateWethPrice(sqrtPriceX96);
+      
+      console.log(`Calculated initial WETH price: $${price}`);
+  
+      if (price > 0) {
+        this.wethPriceUsd = price;
+        
+        // Store WETH price in Token collection
+        await Token.findOneAndUpdate(
+          { contractAddress: this.WETH_ADDRESS },
+          {
+            $set: {
+              price_usd: price,
+              last_updated: new Date()
+            }
+          }
+        );
+  
+        console.log(`Initial WETH Price: $${price}`);
+      } else {
+        console.error('Calculated WETH price is zero or invalid');
+      }
+    } catch (error) {
+      console.error('Detailed error retrieving initial WETH price:', error);
+    }
+  }
+
+  async reconnect() {
+    console.log('Reconnecting...');
+    setTimeout(() => this.initialize(), 5000);
+  }
+
+  async findWethUsdcPool() {
+    try {
+      const factoryABI = ["function getPool(address,address,uint24) view returns (address)"];
+      const factory = new ethers.Contract(this.UNISWAP_FACTORY, factoryABI, this.wsProvider);
+  
+      console.log(`Finding pool for WETH (${this.WETH_ADDRESS}) and USDC (${this.USDC_ADDRESS})`);
+  
+      const feeTiers = [500, 3000, 10000];
+      for (const fee of feeTiers) {
+        console.log(`Trying fee tier: ${fee}`);
+        const poolAddress = await factory.getPool(this.WETH_ADDRESS, this.USDC_ADDRESS, fee);
+        
+        console.log(`Pool address for fee ${fee}: ${poolAddress}`);
+        
+        if (poolAddress && poolAddress !== ethers.ZeroAddress) {
+          console.log(`Found WETH/USDC pool: ${poolAddress}`);
+          return poolAddress;
+        }
       }
       
-      console.log(`Got price data for ${Object.keys(result.tokens).length} tokens`);
-      return result;
-    } catch (apiError) {
-      console.error('GeckoTerminal API error:', apiError.message);
-      return { tokens: {} };
+      console.error('No WETH/USDC pool found across all fee tiers');
+      return null;
+    } catch (error) {
+      console.error('Error finding WETH/USDC pool:', error);
+      return null;
     }
-  } catch (error) {
-    console.error('Error in price data function:', error.message);
-    return { tokens: {} };
   }
-}
 
-// Function to update token prices in a rotating fashion
-async function updateTokenPrices() {
-  // Check if we're approaching the API rate limit
-  if (apiCallsThisMinute >= 29) {
-    console.log('API rate limit reached, skipping update');
-    return;
-  }
-  
-  try {
-    // Get all tokens from the database
-    const allTokens = await Token.find({}, 'contractAddress');
-    
-    if (allTokens.length === 0) {
-      console.log('No tokens found in database');
+  async trackWethPrice() {
+    const poolAddress = await this.findWethUsdcPool();
+    if (!poolAddress) {
+      console.error('No WETH/USDC pool found');
       return;
     }
-    
-    console.log(`Found ${allTokens.length} tokens in the database`);
-    
-    // Get tokens ordered by their last update time (oldest first)
-    const oldestUpdatedTokens = await TokenPrice.find({})
-      .sort({ last_updated: 1 })
-      .limit(300) // Get the 300 oldest updated tokens
-      .select('contractAddress');
-    
-    // Create a list of token addresses to update
-    // If we have price records, use those to find oldest updated tokens
-    // Otherwise, just use the tokens from the Token collection
-    const tokenAddresses = oldestUpdatedTokens.length > 0
-      ? oldestUpdatedTokens.map(t => t.contractAddress)
-      : allTokens.map(t => t.contractAddress);
-    
-    // Calculate how many we can update with remaining API calls
-    // Each call can handle up to 30 tokens
-    const BATCH_SIZE = 30;
-    const remainingCalls = 30 - apiCallsThisMinute;
-    const maxTokens = remainingCalls * BATCH_SIZE;
-    
-    // Limit to the number of tokens we can process with remaining API calls
-    const tokensToProcess = tokenAddresses.slice(0, maxTokens);
-    
-    console.log(`Updating ${tokensToProcess.length} tokens (oldest updated first)`);
-    
-    // Process in batches of 30 (API limit per call)
-    for (let i = 0; i < tokensToProcess.length; i += BATCH_SIZE) {
-      // Safety check to make sure we don't exceed API rate limit
-      if (apiCallsThisMinute >= 29) {
-        console.log('API rate limit reached during batch processing, stopping');
-        break;
-      }
-      
-      const batchAddresses = tokensToProcess.slice(i, i + BATCH_SIZE);
-      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(tokensToProcess.length / BATCH_SIZE);
-      
-      console.log(`Processing batch ${batchNumber}/${totalBatches} (${batchAddresses.length} tokens)`);
-      
+
+    const poolABI = [
+      "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
+    ];
+
+    const poolContract = new ethers.Contract(poolAddress, poolABI, this.wsProvider);
+
+    poolContract.on('Swap', async (sender, recipient, amount0, amount1, sqrtPriceX96) => {
       try {
-        // Fetch price data for this batch
-        const priceData = await fetchPriceData(batchAddresses);
+        // Calculate WETH price using new method
+        const price = this.calculateWethPriceFromSwap(sqrtPriceX96);
         
-        if (priceData && priceData.tokens && Object.keys(priceData.tokens).length > 0) {
-          // Prepare bulk operations for database update
-          const operations = [];
+        if (price > 0) {
+          this.wethPriceUsd = price;
           
-          for (const [address, data] of Object.entries(priceData.tokens)) {
-            operations.push({
-              updateOne: {
-                filter: { contractAddress: address },
-                update: { 
-                  $set: {
-                    ...data,
-                    last_updated: new Date()
-                  }
-                },
-                upsert: true
+          // Update WETH price in Token collection
+          await Token.findOneAndUpdate(
+            { contractAddress: this.WETH_ADDRESS },
+            {
+              $set: {
+                price_usd: price,
+                last_updated: new Date()
               }
-            });
-          }
-          
-          // Execute bulk update
-          if (operations.length > 0) {
-            const result = await TokenPrice.bulkWrite(operations);
-            console.log(`Updated price data for ${operations.length} tokens`);
-          }
+            }
+          );
+  
+          console.log(`WETH Price from Swap: $${price}`);
         }
       } catch (error) {
-        console.error(`Error processing batch ${batchNumber}:`, error);
+        console.error('WETH price tracking error:', error);
       }
-      
-      // Small delay between batches to prevent hammering the API
-      if (i + BATCH_SIZE < tokensToProcess.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+    });
+  }
+
+  async trackTokenPrices() {
+    for (const token of this.tokens) {
+      try {
+        const pool = await this.findTokenPool(token.contractAddress);
+        if (pool) {
+          this.subscribeToPool(pool, token);
+        }
+      } catch (error) {
+        console.error(`Error tracking ${token.symbol}:`, error);
       }
     }
+  }
+
+  async findTokenPool(tokenAddress) {
+    try {
+      const factoryABI = ["function getPool(address,address,uint24) view returns (address)"];
+      const factory = new ethers.Contract(this.UNISWAP_FACTORY, factoryABI, this.wsProvider);
+
+      // Try different fee tiers
+      const feeTiers = [500, 3000, 10000];
+      for (const fee of feeTiers) {
+        const poolAddress = await factory.getPool(tokenAddress, this.WETH_ADDRESS, fee);
+        if (poolAddress && poolAddress !== ethers.ZeroAddress) {
+          return poolAddress;
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error(`Pool finding error for ${tokenAddress}:`, error);
+      return null;
+    }
+  }
+
+  subscribeToPool(poolAddress, token) {
+    const poolABI = [
+      "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
+      "function token0() view returns (address)",
+      "function token1() view returns (address)",
+      "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"
+    ];
+
+    try {
+      const poolContract = new ethers.Contract(poolAddress, poolABI, this.wsProvider);
+
+      poolContract.on('Swap', async (sender, recipient, amount0, amount1, sqrtPriceX96) => {
+        try {
+          const tokenPriceUsd = await this.calculateTokenPriceInUsd(poolContract, token);
+          
+          if (tokenPriceUsd > 0) {
+            // Update price directly in the Token collection
+            await Token.findOneAndUpdate(
+              { contractAddress: token.contractAddress },
+              {
+                $set: {
+                  price_usd: tokenPriceUsd,
+                  last_updated: new Date(),
+                  blockNumber: await this.wsProvider.getBlockNumber()
+                }
+              }
+            );
+
+            console.log(`${token.symbol} Price: $${tokenPriceUsd}`);
+          }
+        } catch (updateError) {
+          console.error(`Price update error for ${token.symbol}:`, updateError);
+        }
+      });
+
+      console.log(`Successfully subscribed to pool for ${token.symbol}`);
+    } catch (error) {
+      console.error(`Subscription error for ${token.symbol}:`, error);
+    }
+  }
+
+  // Fix for calculateWethPrice function
+  calculateWethPrice(sqrtPriceX96) {
+    try {
+      // Convert sqrtPriceX96 to BigInt
+      const sqrtPriceBigInt = BigInt(sqrtPriceX96.toString());
+      
+      // Base constants for calculation
+      const Q96 = BigInt(2) ** BigInt(96);
+      
+      // Calculate price = (sqrtPrice/2^96)^2 * (10^12)
+      // We multiply by 10^12 to account for decimals difference between USDC (6) and WETH (18)
+      const price = Number((sqrtPriceBigInt * sqrtPriceBigInt * BigInt(10**12)) / (Q96 * Q96));
+      
+      console.log('Detailed WETH price calculation:', {
+        sqrtPriceX96: sqrtPriceX96.toString(),
+        sqrtPriceBigInt: sqrtPriceBigInt.toString(),
+        calculatedPrice: price
+      });
+      
+      // Sanity check the price
+      if (isNaN(price) || price <= 0 || price > 1000000) {
+        console.error('Invalid price calculation', {
+          sqrtPriceX96: sqrtPriceX96.toString(),
+          calculatedPrice: price
+        });
+        return 0;
+      }
+      
+      return price;
+    } catch (error) {
+      console.error('WETH price calculation error:', error);
+      return 0;
+    }
+  }
     
-    console.log('Token update cycle completed');
-  } catch (error) {
-    console.error('Error updating token prices:', error);
+  calculateWethPriceFromSwap(sqrtPriceX96) {
+    try {
+      // Convert to BigInt for precise calculation
+      const sqrtPriceBigInt = BigInt(sqrtPriceX96.toString());
+      const Q96 = BigInt(2) ** BigInt(96);
+      
+      // Calculate price = (sqrtPrice/2^96)^2 * (10^12)
+      // Use same formula as initial price calculation for consistency
+      const price = Number((sqrtPriceBigInt * sqrtPriceBigInt * BigInt(10**12)) / (Q96 * Q96));
+      
+      // Add sanity checks
+      if (isNaN(price) || price <= 0 || price > 1000000) {
+        console.error('Invalid swap price calculation', {
+          sqrtPriceX96: sqrtPriceX96.toString(),
+          calculatedPrice: price
+        });
+        return 0;
+      }
+      
+      return price;
+    } catch (error) {
+      console.error('Swap event price calculation error:', error);
+      return 0;
+    }
+  }
+
+  async calculateTokenPriceInUsd(poolContract, token) {
+    try {
+      if (!this.wethPriceUsd) {
+        console.log(`WETH price not available for ${token.symbol}`);
+        return 0;
+      }
+  
+      const [token0, token1, slot0] = await Promise.all([
+        poolContract.token0(),
+        poolContract.token1(),
+        poolContract.slot0()
+      ]);
+  
+      const isToken0Weth = token0.toLowerCase() === this.WETH_ADDRESS.toLowerCase();
+      const isToken1Weth = token1.toLowerCase() === this.WETH_ADDRESS.toLowerCase();
+  
+      if (!isToken0Weth && !isToken1Weth) {
+        console.log(`Neither token is WETH for ${token.symbol}`);
+        return 0;
+      }
+  
+      const sqrtPriceX96 = BigInt(slot0[0].toString());
+      
+      console.log(`${token.symbol} Values:`, {
+        sqrtPriceX96: sqrtPriceX96.toString(),
+        isToken0Weth,
+        isToken1Weth
+      });
+  
+      // Use much larger adjustment for tiny numbers
+      const squared = sqrtPriceX96 * sqrtPriceX96;
+      const denominator = BigInt(2) ** BigInt(192);
+      const adjustment = BigInt(10) ** BigInt(36); // Increased precision for tiny numbers
+      
+      const adjustedPrice = (squared * adjustment) / denominator;
+      const rawPrice = Number(adjustedPrice) / Number(adjustment);
+  
+      console.log(`${token.symbol} Calculation:`, {
+        squared: squared.toString(),
+        adjustedPrice: adjustedPrice.toString(),
+        rawPrice
+      });
+  
+      let priceInWeth;
+      if (isToken0Weth) {
+        priceInWeth = 1 / rawPrice;
+      } else {
+        priceInWeth = rawPrice;
+      }
+      
+      console.log(`${token.symbol} Price in WETH:`, priceInWeth);
+  
+      const priceUsd = priceInWeth * this.wethPriceUsd;
+      console.log(`${token.symbol} Final USD Price:`, priceUsd);
+  
+      // Adjust sanity checks for tiny numbers
+      if (isNaN(priceUsd) || priceUsd < 0 || priceUsd > 1000000) {
+        console.log(`Invalid price for ${token.symbol}: $${priceUsd}`);
+        return 0;
+      }
+  
+      return priceUsd;
+    } catch (error) {
+      console.error(`Price calculation error for ${token.symbol}:`, error);
+      return 0;
+    }
   }
 }
 
-// Initialize data fetching
+// Singleton instance of the tracker
+let trackerInstance = null;
+
 async function initializeDataFetching() {
-  console.log('Initializing token price service...');
-  
-  // Setup API call tracking
-  setupApiCallTracking();
-  
-  // Run initial update
-  await updateTokenPrices();
-  
-  // Setup scheduled job - update tokens every 2 seconds
-  // This will naturally cycle through all tokens over time
-  cron.schedule('*/2 * * * * *', updateTokenPrices);
-  
-  console.log('Token price service initialized with equal priority for all tokens');
-}
-
-// Clean up when shutting down
-function shutdown() {
-  if (apiCallReset) {
-    clearInterval(apiCallReset);
+  if (!trackerInstance) {
+    trackerInstance = new TokenPriceTracker();
+    await trackerInstance.initialize();
   }
-  console.log('Token price service shutdown complete');
+  return trackerInstance;
 }
 
 module.exports = {
-  updateTokenPrices,
   initializeDataFetching,
-  shutdown
+  subscribeToToken: async (contractAddress) => {
+    if (!trackerInstance) {
+      await initializeDataFetching();
+    }
+    // Placeholder for individual token subscription logic
+    return true;
+  }
 };
