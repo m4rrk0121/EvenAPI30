@@ -423,6 +423,38 @@ class TokenPriceTracker {
       return 0;
     }
   }
+
+  async updateTokenPrice(tokenAddress, price, volume) {
+    try {
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ['function totalSupply() view returns (uint256)'],
+        this.wsProvider
+      );
+
+      const totalSupply = await tokenContract.totalSupply();
+      
+      // Find the token first
+      const token = await Token.findOne({ contractAddress: tokenAddress.toLowerCase() });
+      if (!token) {
+        console.error(`Token not found: ${tokenAddress}`);
+        return;
+      }
+
+      // Update the token fields
+      token.price_usd = price;
+      token.total_supply = Number(totalSupply);
+      token.volume_usd_24h = volume || 0;
+      token.last_updated = new Date();
+
+      // Save the token to trigger the pre-save middleware for market cap calculation
+      await token.save();
+
+      console.log(`Updated price for token ${tokenAddress}: $${price}, Market Cap: $${token.market_cap_usd}`);
+    } catch (error) {
+      console.error(`Error updating token ${tokenAddress}:`, error);
+    }
+  }
 }
 
 // Singleton instance of the tracker

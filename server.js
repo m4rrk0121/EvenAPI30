@@ -5,6 +5,7 @@ const path = require('path');
 require('dotenv').config();
 
 const tokenDataService = require('./services/tokenDataService');
+const tokenBatchService = require('./services/tokenBatchService');
 
 const app = express();
 const PORT = process.env.PORT || 4002;
@@ -23,6 +24,9 @@ mongoose.connect(process.env.MONGODB_URI)
     console.log('Connected to MongoDB');
     // Initialize data fetching service after DB connection
     tokenDataService.initializeDataFetching();
+    
+    // Initialize token batch processing
+    tokenBatchService.initializeBatchProcessing();
   })
   .catch(err => console.error('MongoDB connection error:', err));
 

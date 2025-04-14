@@ -9,62 +9,30 @@ router.get('/global-top-tokens', async (req, res) => {
   try {
     const topTokens = await Token.aggregate([
       {
-        $lookup: {
-          from: 'tokenprices',
-          localField: 'contractAddress',
-          foreignField: 'contractAddress',
-          as: 'priceInfo'
-        }
-      },
-      {
-        $unwind: {
-          path: '$priceInfo',
-          preserveNullAndEmptyArrays: false
-        }
-      },
-      {
         $match: {
           $and: [
-            { 'priceInfo.price_usd': { $exists: true } },
-            { 'priceInfo.price_usd': { $gt: 0 } },
-            { 'priceInfo.fdv_usd': { $gt: 5000 } }, // Ensure meaningful market cap
+            { price_usd: { $exists: true } },
+            { price_usd: { $gt: 0 } },
+            { market_cap_usd: { $gt: 5000 } } // Ensure meaningful market cap
           ]
         }
       },
       {
-        $project: {
-          name: 1,
-          symbol: 1,
-          contractAddress: 1,
-          deployer: 1,
-          decimals: 1,
-          price_usd: '$priceInfo.price_usd',
-          fdv_usd: '$priceInfo.fdv_usd',
-          volume_usd: '$priceInfo.volume_usd',
-          last_updated: '$priceInfo.last_updated'
-        }
+        $sort: { market_cap_usd: -1 }
+      },
+      {
+        $limit: 100
       }
     ]);
 
     // Find top market cap token
-    const topMarketCapToken = topTokens.reduce((max, token) => 
-      (token.fdv_usd > (max.fdv_usd || 0) ? token : max), 
+    const topMarketCapToken = topTokens[0];
+
+    // Find top volume token
+    const topVolumeToken = topTokens.reduce((max, token) => 
+      (token.volume_usd_24h > (max.volume_usd_24h || 0) ? token : max), 
       topTokens[0]
     );
-
-    // Find top volume token if volume data exists
-    let topVolumeToken = topTokens[0];
-    
-    if (topTokens.some(token => token.volume_usd > 0)) {
-      topVolumeToken = topTokens.reduce((max, token) => 
-        (token.volume_usd > (max.volume_usd || 0) ? token : max), 
-        topTokens.find(t => t.volume_usd > 0)
-      );
-    } else {
-      // If no volume data, use the token with second highest market cap
-      const sortedByMarketCap = [...topTokens].sort((a, b) => b.fdv_usd - a.fdv_usd);
-      topVolumeToken = sortedByMarketCap[1] || sortedByMarketCap[0];
-    }
 
     console.log('Top Market Cap Token:', topMarketCapToken?.symbol);
     console.log('Top Volume Token:', topVolumeToken?.symbol);
@@ -102,49 +70,21 @@ router.get('/tokens', async (req, res) => {
 
     const tokens = await Token.aggregate([
       {
-        $lookup: {
-          from: 'tokenprices',
-          localField: 'contractAddress',
-          foreignField: 'contractAddress',
-          as: 'priceInfo'
-        }
-      },
-      {
-        $unwind: {
-          path: '$priceInfo',
-          preserveNullAndEmptyArrays: false
-        }
-      },
-      {
         $match: {
           $and: [
-            { 'priceInfo.price_usd': { $exists: true } },
-            { 'priceInfo.price_usd': { $gt: 0 } },
-            { 'priceInfo.price_usd': { $ne: null } },
-            { 'priceInfo.fdv_usd': { $gt: 5000 } }
+            { price_usd: { $exists: true } },
+            { price_usd: { $gt: 0 } },
+            { market_cap_usd: { $gt: 5000 } }
           ]
         }
       },
       {
-        $project: {
-          name: 1,
-          symbol: 1,
-          contractAddress: 1,
-          deployer: 1,
-          decimals: 1,
-          price_usd: '$priceInfo.price_usd',
-          fdv_usd: '$priceInfo.fdv_usd',
-          volume_usd: '$priceInfo.volume_usd',
-          last_updated: '$priceInfo.last_updated'
-        }
-      },
-      {
         $sort: sortField === 'volume' 
-          ? { 'volume_usd': sortDirection === 'desc' ? -1 : 1 }
-          : { 'fdv_usd': sortDirection === 'desc' ? -1 : 1 }
+          ? { 'volume_usd_24h': sortDirection === 'desc' ? -1 : 1 }
+          : { 'market_cap_usd': sortDirection === 'desc' ? -1 : 1 }
       },
       {
-        $limit: 240 // Return up to 240 tokens
+        $limit: 240
       }
     ]);
 
@@ -179,46 +119,13 @@ router.get('/tokens/:contractAddress', async (req, res) => {
     // Ensure we have an active subscription for this token
     tokenDataService.subscribeToToken(contractAddress);
     
-    const token = await Token.aggregate([
-      {
-        $match: { 
-          contractAddress: contractAddress
-        }
-      },
-      {
-        $lookup: {
-          from: 'tokenprices',
-          localField: 'contractAddress',
-          foreignField: 'contractAddress',
-          as: 'priceInfo'
-        }
-      },
-      {
-        $unwind: {
-          path: '$priceInfo',
-          preserveNullAndEmptyArrays: true
-        }
-      },
-      {
-        $project: {
-          name: 1,
-          symbol: 1,
-          contractAddress: 1,
-          deployer: 1,
-          decimals: 1,
-          price_usd: '$priceInfo.price_usd',
-          fdv_usd: '$priceInfo.fdv_usd',
-          volume_usd: '$priceInfo.volume_usd',
-          last_updated: '$priceInfo.last_updated'
-        }
-      }
-    ]);
-
-    if (token.length === 0) {
+    const token = await Token.findOne({ contractAddress });
+    
+    if (!token) {
       return res.status(404).json({ message: 'Token not found' });
     }
 
-    res.json(token[0]);
+    res.json(token);
   } catch (error) {
     console.error('Error fetching token:', error);
     res.status(500).json({ 
