@@ -74,11 +74,8 @@ class TokenBatchProcessor {
       const addressesParam = tokenAddresses.map(addr => addr.toLowerCase()).join('%2C');
       
       console.log(`Fetching GeckoTerminal data for ${tokenAddresses.length} tokens`);
-      console.log('Token addresses:', addressesParam);
       
       const response = await geckoTerminalApi.get(`/networks/base/tokens/multi/${addressesParam}`);
-      
-      console.log('GeckoTerminal API Response:', JSON.stringify(response.data, null, 2));
       
       if (response.data && response.data.data) {
         const result = {};
@@ -123,18 +120,35 @@ class TokenBatchProcessor {
             this.wsProvider
           );
 
-          // Fetch total supply
-          const totalSupply = await tokenContract.totalSupply();
+          // Fetch total supply with timeout and error handling
+          let totalSupply;
+          try {
+            // Add timeout to prevent hanging on problematic contracts
+            const totalSupplyPromise = tokenContract.totalSupply();
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Timeout')), 5000)
+            );
+            
+            totalSupply = await Promise.race([totalSupplyPromise, timeoutPromise]);
+          } catch (supplyError) {
+            console.warn(`Failed to get totalSupply for ${token.symbol}. Skipping this field: ${supplyError.message}`);
+            // Continue with other data even if totalSupply fails
+            totalSupply = token.total_supply || 0;
+          }
           
           // Get GeckoTerminal data for this token
           const tokenData = geckoTerminalData[token.contractAddress.toLowerCase()] || {};
           
           // Update token with new data
-          token.total_supply = Number(totalSupply);
-          token.price_usd = tokenData.price_usd || 0;
-          token.volume_usd_24h = tokenData.volume_usd_24h || 0;
-          token.decimals = tokenData.decimals || 18;
-          token.pool_address = tokenData.pool_address || null;
+          // Only update totalSupply if we successfully retrieved it
+          if (totalSupply !== token.total_supply) {
+            token.total_supply = Number(totalSupply);
+          }
+          
+          token.price_usd = tokenData.price_usd || token.price_usd || 0;
+          token.volume_usd_24h = tokenData.volume_usd_24h || token.volume_usd_24h || 0;
+          token.decimals = tokenData.decimals || token.decimals || 18;
+          token.pool_address = tokenData.pool_address || token.pool_address || null;
           token.last_updated = new Date();
 
           // Save the token to trigger market cap calculation
@@ -148,6 +162,8 @@ class TokenBatchProcessor {
             Pool=${token.pool_address}`);
         } catch (error) {
           console.error(`Error processing token ${token.symbol}:`, error);
+          // Continue with the next token rather than failing the whole batch
+          continue;
         }
       }
     } catch (error) {
@@ -156,17 +172,18 @@ class TokenBatchProcessor {
   }
 }
 
-// Singleton instance
-let processorInstance = null;
-
-async function initializeBatchProcessing() {
-  if (!processorInstance) {
-    processorInstance = new TokenBatchProcessor();
-    await processorInstance.initialize();
+// Export module with singleton management
+const processorInstance = {
+  instance: null,
+  async initializeBatchProcessing() {
+    if (!this.instance) {
+      this.instance = new TokenBatchProcessor();
+      await this.instance.initialize();
+    }
+    return this.instance;
   }
-  return processorInstance;
-}
+};
 
 module.exports = {
-  initializeBatchProcessing
+  initializeBatchProcessing: processorInstance.initializeBatchProcessing.bind(processorInstance)
 }; 
