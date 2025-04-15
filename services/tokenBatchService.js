@@ -26,8 +26,16 @@ class TokenBatchProcessor {
       this.wsProvider = new ethers.WebSocketProvider(process.env.WS_RPC_URL);
       console.log('WebSocket provider connected');
 
-      // Start processing tokens
-      this.processTokensInBatches();
+      // Initial processing
+      await this.processTokensInBatches();
+
+      // Schedule processing every 5 minutes
+      cron.schedule('*/5 * * * *', async () => {
+        console.log('Running scheduled token price update...');
+        await this.processTokensInBatches();
+      });
+
+      console.log('Price updates scheduled for every 5 minutes');
     } catch (error) {
       console.error('Initialization Error:', error);
       this.reconnect();
