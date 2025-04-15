@@ -270,19 +270,49 @@ class TokenPriceTracker {
           const tokenPriceUsd = await this.calculateTokenPriceInUsd(poolContract, token);
           
           if (tokenPriceUsd > 0) {
-            // Update price directly in the Token collection
-            await Token.findOneAndUpdate(
-              { contractAddress: token.contractAddress },
-              {
-                $set: {
-                  price_usd: tokenPriceUsd,
-                  last_updated: new Date(),
-                  blockNumber: await this.wsProvider.getBlockNumber()
-                }
-              }
+            // Get token contract
+            const tokenContract = new ethers.Contract(
+              token.contractAddress,
+              ['function totalSupply() view returns (uint256)'],
+              this.wsProvider
             );
 
-            console.log(`${token.symbol} Price: $${tokenPriceUsd}`);
+            // Fetch total supply with timeout
+            let totalSupply;
+            try {
+              const totalSupplyPromise = tokenContract.totalSupply();
+              const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout')), 5000)
+              );
+              totalSupply = await Promise.race([totalSupplyPromise, timeoutPromise]);
+            } catch (supplyError) {
+              console.warn(`Failed to get totalSupply for ${token.symbol}. Using existing value: ${supplyError.message}`);
+              totalSupply = token.total_supply || 0;
+            }
+
+            // Find and update the token
+            const updatedToken = await Token.findOne({ contractAddress: token.contractAddress.toLowerCase() });
+            if (updatedToken) {
+              // Only update totalSupply if we successfully retrieved it
+              if (totalSupply !== updatedToken.total_supply) {
+                updatedToken.total_supply = Number(totalSupply);
+              }
+              
+              updatedToken.price_usd = tokenPriceUsd;
+              updatedToken.last_updated = new Date();
+              updatedToken.blockNumber = await this.wsProvider.getBlockNumber();
+              updatedToken.pool_address = poolContract.address;
+
+              // Save to trigger pre-save middleware for market cap calculation
+              await updatedToken.save();
+
+              console.log(`Updated token ${token.symbol}: 
+                  Price=$${tokenPriceUsd}, 
+                  Supply=${totalSupply}, 
+                  Volume=$${updatedToken.volume_usd_24h}, 
+                  Market Cap=$${updatedToken.market_cap_usd},
+                  Pool=${poolContract.address}`);
+            }
           }
         } catch (updateError) {
           console.error(`Price update error for ${token.symbol}:`, updateError);
@@ -379,12 +409,6 @@ class TokenPriceTracker {
   
       const sqrtPriceX96 = BigInt(slot0[0].toString());
       
-      console.log(`${token.symbol} Values:`, {
-        sqrtPriceX96: sqrtPriceX96.toString(),
-        isToken0Weth,
-        isToken1Weth
-      });
-  
       // Use much larger adjustment for tiny numbers
       const squared = sqrtPriceX96 * sqrtPriceX96;
       const denominator = BigInt(2) ** BigInt(192);
@@ -393,28 +417,46 @@ class TokenPriceTracker {
       const adjustedPrice = (squared * adjustment) / denominator;
       const rawPrice = Number(adjustedPrice) / Number(adjustment);
   
-      console.log(`${token.symbol} Calculation:`, {
-        squared: squared.toString(),
-        adjustedPrice: adjustedPrice.toString(),
-        rawPrice
-      });
-  
       let priceInWeth;
       if (isToken0Weth) {
         priceInWeth = 1 / rawPrice;
       } else {
         priceInWeth = rawPrice;
       }
-      
-      console.log(`${token.symbol} Price in WETH:`, priceInWeth);
   
       const priceUsd = priceInWeth * this.wethPriceUsd;
-      console.log(`${token.symbol} Final USD Price:`, priceUsd);
   
       // Adjust sanity checks for tiny numbers
       if (isNaN(priceUsd) || priceUsd < 0 || priceUsd > 1000000) {
         console.log(`Invalid price for ${token.symbol}: $${priceUsd}`);
         return 0;
+      }
+
+      // Get total supply
+      const tokenContract = new ethers.Contract(
+        token.contractAddress,
+        ['function totalSupply() view returns (uint256)'],
+        this.wsProvider
+      );
+      const totalSupply = await tokenContract.totalSupply();
+
+      // Update token in database
+      const updatedToken = await Token.findOne({ contractAddress: token.contractAddress.toLowerCase() });
+      if (updatedToken) {
+        updatedToken.price_usd = priceUsd;
+        updatedToken.total_supply = Number(totalSupply);
+        updatedToken.last_updated = new Date();
+        updatedToken.blockNumber = await this.wsProvider.getBlockNumber();
+        
+        // Save to trigger pre-save middleware for market cap calculation
+        await updatedToken.save();
+
+        console.log(`Updated token ${token.symbol}: 
+            Price=$${priceUsd}, 
+            Supply=${totalSupply}, 
+            Volume=$${updatedToken.volume_usd_24h}, 
+            Market Cap=$${updatedToken.market_cap_usd},
+            Pool=${poolContract.address}`);
       }
   
       return priceUsd;
