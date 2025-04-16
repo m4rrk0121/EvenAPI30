@@ -255,73 +255,41 @@ class TokenPriceTracker {
   }
 
   subscribeToPool(poolAddress, token) {
-    const poolABI = [
-      "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
-      "function token0() view returns (address)",
-      "function token1() view returns (address)",
-      "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"
-    ];
-
     try {
+      const poolABI = [
+        "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
+      ];
+
       const poolContract = new ethers.Contract(poolAddress, poolABI, this.wsProvider);
 
       poolContract.on('Swap', async (sender, recipient, amount0, amount1, sqrtPriceX96) => {
         try {
-          const tokenPriceUsd = await this.calculateTokenPriceInUsd(poolContract, token);
+          // Calculate token price
+          const price = await this.calculateTokenPriceInUsd(poolContract, token);
           
-          if (tokenPriceUsd > 0) {
-            // Get token contract
-            const tokenContract = new ethers.Contract(
-              token.contractAddress,
-              ['function totalSupply() view returns (uint256)'],
-              this.wsProvider
-            );
-
-            // Fetch total supply with timeout
-            let totalSupply;
-            try {
-              const totalSupplyPromise = tokenContract.totalSupply();
-              const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Timeout')), 5000)
-              );
-              totalSupply = await Promise.race([totalSupplyPromise, timeoutPromise]);
-            } catch (supplyError) {
-              console.warn(`Failed to get totalSupply for ${token.symbol}. Using existing value: ${supplyError.message}`);
-              totalSupply = token.total_supply || 0;
-            }
-
-            // Find and update the token
-            const updatedToken = await Token.findOne({ contractAddress: token.contractAddress.toLowerCase() });
-            if (updatedToken) {
-              // Only update totalSupply if we successfully retrieved it
-              if (totalSupply !== updatedToken.total_supply) {
-                updatedToken.total_supply = Number(totalSupply);
+          if (price > 0) {
+            // Update token with new price and last trade time
+            await Token.findOneAndUpdate(
+              { contractAddress: token.contractAddress },
+              {
+                $set: {
+                  price_usd: price,
+                  last_updated: new Date(),
+                  last_trade: new Date()
+                }
               }
-              
-              updatedToken.price_usd = tokenPriceUsd;
-              updatedToken.last_updated = new Date();
-              updatedToken.blockNumber = await this.wsProvider.getBlockNumber();
-              updatedToken.pool_address = poolContract.address;
-
-              // Save to trigger pre-save middleware for market cap calculation
-              await updatedToken.save();
-
-              console.log(`Updated token ${token.symbol}: 
-                  Price=$${tokenPriceUsd}, 
-                  Supply=${totalSupply}, 
-                  Volume=$${updatedToken.volume_usd_24h}, 
-                  Market Cap=$${updatedToken.market_cap_usd},
-                  Pool=${poolContract.address}`);
-            }
+            );
+            
+            console.log(`Updated ${token.symbol} price: $${price} (Last trade: ${new Date()})`);
           }
-        } catch (updateError) {
-          console.error(`Price update error for ${token.symbol}:`, updateError);
+        } catch (error) {
+          console.error(`Error processing swap for ${token.symbol}:`, error);
         }
       });
 
-      console.log(`Successfully subscribed to pool for ${token.symbol}`);
+      console.log(`Subscribed to pool ${poolAddress} for ${token.symbol}`);
     } catch (error) {
-      console.error(`Subscription error for ${token.symbol}:`, error);
+      console.error(`Error subscribing to pool for ${token.symbol}:`, error);
     }
   }
 

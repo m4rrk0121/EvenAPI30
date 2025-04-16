@@ -53,6 +53,10 @@ const TokenSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
+  last_trade: {
+    type: Date,
+    default: null
+  },
   blockNumber: {
     type: Number,
     default: 0
