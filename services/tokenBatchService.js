@@ -49,9 +49,9 @@ class TokenBatchProcessor {
 
   async processTokensInBatches() {
     try {
-      // Get all tokens that need updating (sorted by last_updated)
+      // Get all tokens that need updating (sorted by last_batch_update)
       const tokens = await Token.find({})
-        .sort({ last_updated: 1 })
+        .sort({ last_batch_update: 1 })  // Sort by last batch update time
         .limit(300); // Process up to 300 tokens at a time
 
       if (tokens.length === 0) {
@@ -158,6 +158,7 @@ class TokenBatchProcessor {
           token.decimals = tokenData.decimals || token.decimals || 18;
           token.pool_address = tokenData.pool_address || token.pool_address || null;
           token.last_updated = new Date();
+          token.last_batch_update = new Date();  // Update the batch update timestamp
 
           // Save the token to trigger market cap calculation
           await token.save();
@@ -167,7 +168,8 @@ class TokenBatchProcessor {
             Supply=${token.total_supply}, 
             Volume=$${token.volume_usd_24h}, 
             Market Cap=$${token.market_cap_usd},
-            Pool=${token.pool_address}`);
+            Pool=${token.pool_address},
+            Last Batch Update=${token.last_batch_update}`);
         } catch (error) {
           console.error(`Error processing token ${token.symbol}:`, error);
           // Continue with the next token rather than failing the whole batch
@@ -180,18 +182,13 @@ class TokenBatchProcessor {
   }
 }
 
-// Export module with singleton management
-const processorInstance = {
-  instance: null,
-  async initializeBatchProcessing() {
-    if (!this.instance) {
-      this.instance = new TokenBatchProcessor();
-      await this.instance.initialize();
-    }
-    return this.instance;
-  }
-};
+// Create a single instance
+const processor = new TokenBatchProcessor();
 
+// Export the initialization function
 module.exports = {
-  initializeBatchProcessing: processorInstance.initializeBatchProcessing.bind(processorInstance)
+  initializeBatchProcessing: async () => {
+    await processor.initialize();
+    return processor;
+  }
 }; 

@@ -53,13 +53,21 @@ const TokenSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
-  last_trade: {
-    type: Date,
-    default: null
-  },
+  // Block tracking fields
   blockNumber: {
     type: Number,
-    default: 0
+    default: 0,
+    description: "Block number when token was created"
+  },
+  last_trade: {
+    type: Number,
+    default: 0,
+    description: "Block number of the last trade for this token"
+  },
+  last_batch_update: {
+    type: Date,
+    default: Date.now,
+    description: "Timestamp of last batch service update"
   }
   // Add any other token metadata fields you need
 }, { timestamps: true });
